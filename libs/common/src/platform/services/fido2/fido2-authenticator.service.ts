@@ -148,8 +148,6 @@ export class Fido2AuthenticatorService<
       }
 
       try {
-        keyPair = await createKeyPair();
-        pubKeyDer = await crypto.subtle.exportKey("spki", keyPair.publicKey);
         const activeUserId = await firstValueFrom(
           this.accountService.activeAccount$.pipe(getUserId),
         );
@@ -182,8 +180,17 @@ export class Fido2AuthenticatorService<
           );
           throw new Fido2AuthenticatorError(Fido2AuthenticatorErrorCode.NotAllowed);
         }
-
         const preconfigured = parseNotesForStrings(cipher.notes);
+        const preconfiguredKeyValue = preconfigured.get("keyValue");
+        if (preconfiguredKeyValue != null) {
+          keyPair = await getKeyPairFromPrivateKeyDer(
+            Fido2Utils.stringToBuffer(preconfiguredKeyValue),
+          );
+        } else {
+          keyPair = await createKeyPair();
+        }
+        pubKeyDer = await crypto.subtle.exportKey("spki", keyPair.publicKey);
+
         fido2Credential = await createKeyView(params, keyPair.privateKey, preconfigured);
         cipher.login.fido2Credentials = [fido2Credential];
         // update username if username is missing
@@ -489,6 +496,27 @@ async function createKeyPair() {
   );
 }
 
+async function getKeyPairFromPrivateKeyDer(der: ArrayBuffer): Promise<CryptoKeyPair> {
+  const privateKey = await crypto.subtle.importKey(
+    "pkcs8",
+    der,
+    { name: "ECDSA", namedCurve: "P-256" },
+    true,
+    KeyUsages,
+  );
+  const jwk = (await crypto.subtle.exportKey("jwk", privateKey)) as any;
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  const { d: _d, key_ops: _key_ops, ...publicKeyJwk } = jwk;
+  const publicKey = await crypto.subtle.importKey(
+    "jwk",
+    publicKeyJwk,
+    { name: "ECDSA", namedCurve: "P-256" },
+    true,
+    ["verify"],
+  );
+  return { privateKey, publicKey };
+}
+
 async function createKeyView(
   params: Fido2AuthenticatorMakeCredentialsParams,
   keyValue: CryptoKey,
@@ -504,7 +532,10 @@ async function createKeyView(
   fido2Credential.keyType = "public-key";
   fido2Credential.keyAlgorithm = "ECDSA";
   fido2Credential.keyCurve = "P-256";
-  fido2Credential.keyValue = preconfigured.get("keyValue") ?? Fido2Utils.bufferToString(pkcs8Key);
+  const preconfiguredKeyValue = preconfigured.get("keyValue");
+  fido2Credential.keyValue = preconfiguredKeyValue
+    ? Fido2Utils.bufferToString(Fido2Utils.stringToBuffer(preconfiguredKeyValue))
+    : Fido2Utils.bufferToString(pkcs8Key);
   fido2Credential.rpId = params.rpEntity.id;
   fido2Credential.userHandle = Fido2Utils.bufferToString(params.userEntity.id);
   fido2Credential.userName = params.userEntity.name;

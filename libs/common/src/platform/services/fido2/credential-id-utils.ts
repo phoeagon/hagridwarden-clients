@@ -1,5 +1,6 @@
 // FIXME: Update this file to be type safe and remove this and next line
 // @ts-strict-ignore
+import { Utils } from "../../misc/utils";
 import { Fido2Utils } from "./fido2-utils";
 import { guidToRawFormat } from "./guid-utils";
 
@@ -10,7 +11,13 @@ export function parseCredentialId(encodedCredentialId: string): ArrayBuffer {
       return buffer.byteLength === 0 ? undefined : buffer;
     }
 
-    return guidToRawFormat(encodedCredentialId).buffer;
+    if (Utils.isGuid(encodedCredentialId)) {
+      return guidToRawFormat(encodedCredentialId).buffer;
+    }
+
+    // Fallback: treat as base64url if not a GUID
+    const buffer = Fido2Utils.stringToBuffer(encodedCredentialId);
+    return buffer.byteLength < 10 ? undefined : buffer;
   } catch {
     return undefined;
   }

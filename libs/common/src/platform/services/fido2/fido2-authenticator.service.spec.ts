@@ -359,6 +359,76 @@ describe("FidoAuthenticatorService", () => {
 
         await expect(result).rejects.toThrowError(Fido2AuthenticatorErrorCode.Unknown);
       });
+
+      it("should normalize keyValue from standard Base64 to URL-safe Base64", async () => {
+        const standardB64Key =
+          "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgTC+7XDZipXbaVBlnkjlBgO16ZmqBZWejK2iYo6lV0dehRANCAASOcM2WduNq1DriRYN7ZekvZz+bRhA+qNT4v0fbp5suUFJyWmgOQ0bybZcLXHaerK5Ep1JiSrQcewtQNgLtry7f";
+        const urlSafeB64Key =
+          "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgTC-7XDZipXbaVBlnkjlBgO16ZmqBZWejK2iYo6lV0dehRANCAASOcM2WduNq1DriRYN7ZekvZz-bRhA-qNT4v0fbp5suUFJyWmgOQ0bybZcLXHaerK5Ep1JiSrQcewtQNgLtry7f";
+
+        const existingCipherWithNotes = await createCipherView({ type: CipherType.Login });
+        existingCipherWithNotes.notes = `keyValue: ${standardB64Key}`;
+
+        userInterfaceSession.confirmNewCredential.mockResolvedValue({
+          cipherId: existingCipherWithNotes.id,
+          userVerified: false,
+        });
+
+        cipherService.ciphers$.mockImplementation(() =>
+          of({ [existingCipherWithNotes.id as CipherId]: {} as CipherData }),
+        );
+        cipherService.decrypt.mockResolvedValue(existingCipherWithNotes);
+
+        await authenticator.makeCredential(params, windowReference);
+
+        const savedCipher = cipherService.updateWithServer.mock.lastCall?.[0];
+        expect(savedCipher.login.fido2Credentials[0].keyValue).toEqual(urlSafeB64Key);
+      });
+
+      it("should use preconfigured keyValue from notes and derive correct public key", async () => {
+        const standardB64Key =
+          "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgTC+7XDZipXbaVBlnkjlBgO16ZmqBZWejK2iYo6lV0dehRANCAASOcM2WduNq1DriRYN7ZekvZz+bRhA+qNT4v0fbp5suUFJyWmgOQ0bybZcLXHaerK5Ep1JiSrQcewtQNgLtry7f";
+        const expectedPubKeyDer = Fido2Utils.stringToBuffer(
+          "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEjnDNlnbjatQ64kWDe2XpL2c_m0YQPqjU-L9H26ebLlBSclpoDkNG8m2XC1x2nqyuRKdSYkq0HHsLUDYC7a8u3w",
+        );
+
+        const existingCipherWithNotes = await createCipherView({ type: CipherType.Login });
+        existingCipherWithNotes.notes = `keyValue: ${standardB64Key}`;
+
+        userInterfaceSession.confirmNewCredential.mockResolvedValue({
+          cipherId: existingCipherWithNotes.id,
+          userVerified: false,
+        });
+
+        cipherService.ciphers$.mockImplementation(() =>
+          of({ [existingCipherWithNotes.id as CipherId]: {} as CipherData }),
+        );
+        cipherService.decrypt.mockResolvedValue(existingCipherWithNotes);
+
+        const result = await authenticator.makeCredential(params, windowReference);
+
+        expect(Fido2Utils.bufferSourceToUint8Array(result.publicKey)).toEqual(
+          Fido2Utils.bufferSourceToUint8Array(expectedPubKeyDer),
+        );
+
+        // Verify that the attestation object also contains the correct public key coordinates
+        const attestationObject = CBOR.decode(
+          Fido2Utils.bufferSourceToUint8Array(result.attestationObject).buffer,
+        );
+        const authData = Fido2Utils.bufferSourceToUint8Array(attestationObject.authData);
+
+        // COSE key for ES256 (P-256)
+        // x coordinate is at offset 10 (length 32)
+        // y coordinate is at offset 10 + 32 + 3 (length 32)
+        const x = authData.slice(71 + 10, 71 + 10 + 32);
+        const y = authData.slice(71 + 10 + 32 + 3, 71 + 10 + 32 + 3 + 32);
+
+        const expectedX = Utils.fromUrlB64ToArray("jnDNlnbjatQ64kWDe2XpL2c_m0YQPqjU-L9H26ebLlA");
+        const expectedY = Utils.fromUrlB64ToArray("UnJaaA5DRvJtlwtcdp6srkSnUmJKtBx7C1A2Au2vLt8");
+
+        expect(x).toEqual(expectedX);
+        expect(y).toEqual(expectedY);
+      });
     });
 
     describe(`attestation of new credential`, () => {
@@ -854,6 +924,37 @@ describe("FidoAuthenticatorService", () => {
         }),
       };
     }
+  });
+
+  describe("parseCredentialId", () => {
+    it("should parse GUID strings", () => {
+      const guid = "52217b91-73f1-4fea-b3f2-54a7959fd5aa";
+      const result = parseCredentialId(guid);
+      expect(result).toBeDefined();
+      expect(result.byteLength).toBe(16);
+    });
+
+    it("should parse b64. prefixed strings", () => {
+      const b64Id = "b64.SSYq66fXQk62QNOdAeRXbg";
+      const result = parseCredentialId(b64Id);
+      expect(result).toBeDefined();
+      expect(result.byteLength).toBe(16);
+    });
+
+    it("should parse non-GUID base64url strings (fallback)", () => {
+      const base64urlId = "SSYq66fXQk62QNOdAeRXbg";
+      const result = parseCredentialId(base64urlId);
+      expect(result).toBeDefined();
+      expect(result.byteLength).toBe(16);
+
+      const expected = Fido2Utils.stringToBuffer(base64urlId);
+      expect(new Uint8Array(result)).toEqual(new Uint8Array(expected));
+    });
+
+    it("should return undefined for invalid strings", () => {
+      const invalid = "!!!";
+      expect(parseCredentialId(invalid)).toBeUndefined();
+    });
   });
 });
 
