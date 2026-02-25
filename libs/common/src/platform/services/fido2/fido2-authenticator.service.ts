@@ -32,9 +32,12 @@ import { compareCredentialIds, parseCredentialId } from "./credential-id-utils";
 import { p1363ToDer } from "./ecdsa-utils";
 import { Fido2Utils } from "./fido2-utils";
 
-// AAGUID: d548826e-79b4-db40-a3d8-11116f7e8349
+// AAGUID: intentionally changed from Bitwarden. We are introducing breaking changes here.
 export const AAGUID = new Uint8Array([
-  0xd5, 0x48, 0x82, 0x6e, 0x79, 0xb4, 0xdb, 0x40, 0xa3, 0xd8, 0x11, 0x11, 0x6f, 0x7e, 0x83, 0x49,
+  // 0xd5, 0x48, 0x82, 0x6e, 0x79, 0xb4, 0xdb, 0x40, 0xa3, 0xd8, 0x11, 0x11, 0x6f, 0x7e, 0x83, 0x49,
+  // We are introducing breaking changes. We can no longer declare we are Bitwarden.
+  // We define a new AAGUID here.
+  0x49, 0x83, 0x7e, 0x6f, 0x11, 0x11, 0xd8, 0xa3, 0x40, 0xdb, 0xb4, 0x79, 0x6e, 0x82, 0x48, 0xd5,
 ]);
 
 const KeyUsages: KeyUsage[] = ["sign"];
@@ -180,7 +183,8 @@ export class Fido2AuthenticatorService<
           throw new Fido2AuthenticatorError(Fido2AuthenticatorErrorCode.NotAllowed);
         }
 
-        fido2Credential = await createKeyView(params, keyPair.privateKey);
+        const preconfigured = parseNotesForStrings(cipher.notes);
+        fido2Credential = await createKeyView(params, keyPair.privateKey, preconfigured);
         cipher.login.fido2Credentials = [fido2Credential];
         // update username if username is missing
         if (Utils.isNullOrEmpty(cipher.login.username)) {
@@ -196,14 +200,17 @@ export class Fido2AuthenticatorService<
         throw new Fido2AuthenticatorError(Fido2AuthenticatorErrorCode.Unknown);
       }
 
-      const authData = await generateAuthData({
-        rpId: params.rpEntity.id,
-        credentialId: parseCredentialId(credentialId),
-        counter: fido2Credential.counter,
-        userPresence: true,
-        userVerification: userVerified,
-        keyPair,
-      });
+      const authData = await generateAuthData(
+        {
+          rpId: params.rpEntity.id,
+          credentialId: parseCredentialId(credentialId),
+          counter: fido2Credential.counter,
+          userPresence: true,
+          userVerification: userVerified,
+          keyPair,
+        },
+        cipher,
+      );
       const attestationObject = new Uint8Array(
         CBOR.encode({
           fmt: "none",
@@ -330,13 +337,16 @@ export class Fido2AuthenticatorService<
           await this.cipherService.clearCache(activeUserId);
         }
 
-        const authenticatorData = await generateAuthData({
-          rpId: selectedFido2Credential.rpId,
-          credentialId: parseCredentialId(selectedCredentialId),
-          counter: selectedFido2Credential.counter,
-          userPresence: true,
-          userVerification: userVerified,
-        });
+        const authenticatorData = await generateAuthData(
+          {
+            rpId: selectedFido2Credential.rpId,
+            credentialId: parseCredentialId(selectedCredentialId),
+            counter: selectedFido2Credential.counter,
+            userPresence: true,
+            userVerification: userVerified,
+          },
+          selectedCipher,
+        );
 
         const signature = await generateSignature({
           authData: authenticatorData,
@@ -482,6 +492,7 @@ async function createKeyPair() {
 async function createKeyView(
   params: Fido2AuthenticatorMakeCredentialsParams,
   keyValue: CryptoKey,
+  preconfigured: Map<string, string>,
 ): Promise<Fido2CredentialView> {
   if (keyValue.algorithm.name !== "ECDSA" && (keyValue.algorithm as any).namedCurve !== "P-256") {
     throw new Fido2AuthenticatorError(Fido2AuthenticatorErrorCode.Unknown);
@@ -489,11 +500,11 @@ async function createKeyView(
 
   const pkcs8Key = await crypto.subtle.exportKey("pkcs8", keyValue);
   const fido2Credential = new Fido2CredentialView();
-  fido2Credential.credentialId = Utils.newGuid();
+  fido2Credential.credentialId = preconfigured.get("credentialId") ?? Utils.newGuid();
   fido2Credential.keyType = "public-key";
   fido2Credential.keyAlgorithm = "ECDSA";
   fido2Credential.keyCurve = "P-256";
-  fido2Credential.keyValue = Fido2Utils.bufferToString(pkcs8Key);
+  fido2Credential.keyValue = preconfigured.get("keyValue") ?? Fido2Utils.bufferToString(pkcs8Key);
   fido2Credential.rpId = params.rpEntity.id;
   fido2Credential.userHandle = Fido2Utils.bufferToString(params.userEntity.id);
   fido2Credential.userName = params.userEntity.name;
@@ -531,7 +542,7 @@ interface AuthDataParams {
   keyPair?: CryptoKeyPair;
 }
 
-async function generateAuthData(params: AuthDataParams) {
+async function generateAuthData(params: AuthDataParams, cipher: CipherView) {
   const authData: Array<number> = [];
 
   const rpIdHash = new Uint8Array(
@@ -542,11 +553,12 @@ async function generateAuthData(params: AuthDataParams) {
   );
   authData.push(...rpIdHash);
 
+  const configFlags: Map<string, boolean> = parseNotesForAuthFlags(cipher.notes);
   const flags = authDataFlags({
-    extensionData: false,
+    extensionData: configFlags.get("extensionData") ?? false,
     attestationData: params.keyPair != undefined,
-    backupEligibility: true,
-    backupState: true, // Credentials are always synced
+    backupEligibility: configFlags.get("backupEligibility") ?? true,
+    backupState: configFlags.get("backupState") ?? true,
     userVerification: params.userVerification,
     userPresence: params.userPresence,
   });
@@ -562,11 +574,14 @@ async function generateAuthData(params: AuthDataParams) {
     counter & 0x000000ff,
   );
 
+  const notes: string = cipher.notes ?? "";
+  const aaguid: Uint8Array = parseNotesForAAGUID(notes) ?? AAGUID;
+
   if (params.keyPair) {
     // attestedCredentialData
     const attestedCredentialData: Array<number> = [];
 
-    attestedCredentialData.push(...AAGUID);
+    attestedCredentialData.push(...aaguid);
 
     // credentialIdLength (2 bytes) and credential Id
     const rawId = Fido2Utils.bufferSourceToUint8Array(params.credentialId);
@@ -629,6 +644,65 @@ interface Flags {
   backupState: boolean;
   userVerification: boolean;
   userPresence: boolean;
+}
+
+function parseNotesForAAGUID(notes: string): Uint8Array | undefined {
+  if (!notes) {
+    return undefined;
+  }
+  const match = notes.match(/AAGUID[:]?\s*([0-9a-fA-F-]{32,36})/i);
+  if (!match) {
+    return undefined;
+  }
+  const cleanUuid = match[1].replace(/-/g, "");
+  if (cleanUuid.length !== 32) {
+    return undefined;
+  }
+  const result = new Uint8Array(16);
+  for (let i = 0; i < 16; i++) {
+    result[i] = parseInt(cleanUuid.substring(i * 2, i * 2 + 2), 16);
+  }
+  return result;
+}
+
+function parseNotesForAuthFlags(notes: string): Map<string, boolean> {
+  const flags = new Map<string, boolean>();
+  if (!notes) {
+    return flags;
+  }
+  const lines = notes.split(/\r?\n/);
+  const keys = ["extensionData", "backupEligibility", "backupState"];
+
+  for (const line of lines) {
+    for (const key of keys) {
+      const regex = new RegExp(`${key}[:]?\\s*(true|false)`, "i");
+      const match = line.match(regex);
+      if (match) {
+        flags.set(key, match[1].toLowerCase() === "true");
+      }
+    }
+  }
+  return flags;
+}
+
+function parseNotesForStrings(notes: string): Map<string, string> {
+  const result = new Map<string, string>();
+  if (!notes) {
+    return result;
+  }
+  const lines = notes.split(/\r?\n/);
+  const keys = ["credentialId", "keyValue"];
+
+  for (const line of lines) {
+    for (const key of keys) {
+      const regex = new RegExp(`${key}[:]?\\s*(\\S+)`, "i");
+      const match = line.match(regex);
+      if (match && match[1].length >= 5) {
+        result.set(key, match[1]);
+      }
+    }
+  }
+  return result;
 }
 
 function authDataFlags(options: Flags): number {
